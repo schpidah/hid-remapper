@@ -88,6 +88,39 @@ uint8_t sticky_state[MAX_INPUT_STATES];                  // state per layer (mas
 std::unordered_map<uint64_t, int32_t*> usage_state_ptr;  // usage -> input_state pointer
 uint32_t used_state_slots = 0;
 
+// While a tap-hold key's tap-or-hold decision is undecided, received inputs
+// (other than those that apply immediately, see state_slot_immediate) are
+// queued here and replayed in arrival order once the decision is made, so
+// that rolling key presses reach the host in the right order.
+struct buffered_input_report_t {
+    uint64_t received_at;
+    uint16_t interface;
+    uint8_t report_id;
+    uint8_t len;
+    uint8_t data[MAX_REPORT_SIZE];
+};
+
+#define IB_BUFSIZE 64
+static buffered_input_report_t input_buffer[IB_BUFSIZE];
+static uint8_t ib_head = 0;
+static uint8_t ib_tail = 0;
+static uint8_t ib_items = 0;
+
+// slots that are applied immediately even while buffering:
+// relative usages (e.g. mouse movement) and tap-hold source usages
+// (the tap-hold state machine needs to see press/release edges live,
+// its outputs are deferred anyway)
+static uint8_t state_slot_immediate[MAX_INPUT_STATES];
+
+#define SLOT_SAVE_CAP 512
+struct slot_save_t {
+    int32_t* ptr;
+    int32_t value;
+};
+static slot_save_t slot_saves[SLOT_SAVE_CAP];
+
+static void flush_oldest_buffered_report();
+
 std::unordered_map<uint32_t, int32_t> accumulated;  // usage -> relative movement, * 1000
 uint8_t layer_state_mask = 1;
 
@@ -398,6 +431,9 @@ void set_mapping_from_config() {
     memset(input_state, 0, sizeof(input_state));
     memset(tap_hold_state, 0, sizeof(tap_hold_state));
     memset(sticky_state, 0, sizeof(sticky_state));
+    ib_head = 0;
+    ib_tail = 0;
+    ib_items = 0;
     active_ports_mask = 0;
     uint32_t gpio_in_mask_ = 0;
     uint32_t gpio_out_mask_ = 0;
@@ -1087,6 +1123,35 @@ int32_t eval_expr(uint8_t expr, uint64_t now, bool auto_repeat) {
     return 0;
 }
 
+// Returns true if some tap-hold key that was pressed at or before `since`
+// hasn't had its tap-or-hold decision fully played out yet, meaning inputs
+// buffered at time `since` can't be replayed yet without reordering.
+static bool tap_hold_blocks_flush(uint64_t now, uint64_t since) {
+    for (auto const& tap_hold : tap_hold_usages) {
+        if (*tap_hold.input_state != 0) {
+            if (*(tap_hold.input_state + PREV_STATE_OFFSET) == 0) {
+                // press edge not processed yet, pressed_at is not set yet
+                return true;
+            }
+            if (!tap_hold.tap_hold_state->hold &&
+                (now - tap_hold.pressed_at < tap_hold_threshold) &&
+                (tap_hold.pressed_at <= since)) {
+                return true;
+            }
+        } else if (tap_hold.pressed_at <= since) {
+            if (*(tap_hold.input_state + PREV_STATE_OFFSET) != 0) {
+                // release edge not processed yet, the tap pulse may fire this frame
+                return true;
+            }
+            if (tap_hold.tap_hold_state->tap) {
+                // tap pulse went out last frame, the corresponding release goes out this frame
+                return true;
+            }
+        }
+    }
+    return false;
+}
+
 void process_mapping(bool auto_repeat) {
     if (suspended) {
         return;
@@ -1094,6 +1159,16 @@ void process_mapping(bool auto_repeat) {
 
     uint64_t now = get_time();
     frame_counter++;
+
+    // replay at most one buffered input report per frame so that each one
+    // gets its own output report and ordering is preserved on the host side
+    if (ib_items > 0) {
+        my_mutex_enter(MutexId::THEIR_USAGES);
+        if ((ib_items > 0) && !tap_hold_blocks_flush(now, input_buffer[ib_head].received_at)) {
+            flush_oldest_buffered_report();
+        }
+        my_mutex_exit(MutexId::THEIR_USAGES);
+    }
 
     for (auto& tap_hold : tap_hold_usages) {
         if ((*tap_hold.input_state != 0) && (*(tap_hold.input_state + PREV_STATE_OFFSET) == 0)) {
@@ -1635,6 +1710,122 @@ static inline bool is_rollover(const uint8_t* report, int len, uint16_t interfac
     return false;
 }
 
+static inline bool is_immediate_slot(const int32_t* state_ptr) {
+    return state_slot_immediate[state_ptr - input_state] != 0;
+}
+
+// Is some tap-hold key pressed with its tap-or-hold decision still undecided?
+static bool tap_hold_pending() {
+    for (auto const& tap_hold : tap_hold_usages) {
+        if ((*tap_hold.input_state != 0) && !tap_hold.tap_hold_state->hold) {
+            return true;
+        }
+    }
+    return false;
+}
+
+// Save the current values of the input_state slots that a report for this
+// interface/report_id can touch, keeping either only the immediately applied
+// slots or only the deferred ones. Returns the number of slots saved,
+// or -1 if they don't fit in slot_saves.
+static int collect_slot_saves(uint16_t interface, uint8_t report_id, bool immediate) {
+    int n = 0;
+    for (int32_t* state_ptr : array_range_usages[interface][report_id]) {
+        if (is_immediate_slot(state_ptr) == immediate) {
+            if (n == SLOT_SAVE_CAP) {
+                return -1;
+            }
+            slot_saves[n++] = (slot_save_t){ .ptr = state_ptr, .value = *state_ptr };
+        }
+    }
+    for (auto const& their : their_used_usages[interface][report_id]) {
+        int32_t* ptrs[2] = { their.usage_def.input_state_0, their.usage_def.input_state_n };
+        for (int32_t* state_ptr : ptrs) {
+            if ((state_ptr != NULL) && (is_immediate_slot(state_ptr) == immediate)) {
+                if (n == SLOT_SAVE_CAP) {
+                    return -1;
+                }
+                slot_saves[n++] = (slot_save_t){ .ptr = state_ptr, .value = *state_ptr };
+            }
+        }
+    }
+    return n;
+}
+
+static void apply_input_report(const uint8_t* report, int len, uint16_t interface, uint8_t report_id, uint8_t interface_idx, uint8_t hub_port) {
+    for (int32_t* state_ptr : array_range_usages[interface][report_id]) {
+        *state_ptr &= ~(1 << interface_idx);
+    }
+
+    for (auto const& their : their_used_usages[interface][report_id]) {
+        if (their.usage_def.usage_maximum == 0) {
+            read_input(report, len, their.usage, their.usage_def, interface_idx);
+        } else {
+            read_input_range(report, len, their.usage, their.usage_def, interface_idx, hub_port);
+        }
+    }
+}
+
+static void flush_oldest_buffered_report() {
+    buffered_input_report_t& buffered = input_buffer[ib_head];
+    ib_head = (ib_head + 1) % IB_BUFSIZE;
+    ib_items--;
+
+    uint8_t interface_idx = interface_index[buffered.interface];
+    uint8_t hub_port = hub_ports[buffered.interface >> 8];
+
+    // The immediately applied slots (relative movement, tap-hold keys) already
+    // saw this report when it arrived, don't apply it to them a second time.
+    int nsaves = collect_slot_saves(buffered.interface, buffered.report_id, true);
+    apply_input_report(buffered.data, buffered.len, buffered.interface, buffered.report_id, interface_idx, hub_port);
+    for (int i = 0; i < nsaves; i++) {
+        *slot_saves[i].ptr = slot_saves[i].value;
+    }
+}
+
+// Apply only the immediately applied slots of this report and queue it for
+// later replay if it changes any deferred slot. Returns false if the report
+// can't be buffered and has to be applied the normal way.
+static bool buffer_input_report(const uint8_t* report, int len, uint16_t interface, uint8_t report_id, uint8_t interface_idx, uint8_t hub_port) {
+    if (len > MAX_REPORT_SIZE) {
+        return false;
+    }
+    int nsaves = collect_slot_saves(interface, report_id, false);
+    if (nsaves < 0) {
+        return false;
+    }
+
+    apply_input_report(report, len, interface, report_id, interface_idx, hub_port);
+
+    bool deferred_change = false;
+    for (int i = 0; i < nsaves; i++) {
+        if (*slot_saves[i].ptr != slot_saves[i].value) {
+            deferred_change = true;
+            *slot_saves[i].ptr = slot_saves[i].value;
+        }
+    }
+
+    // if the report doesn't change any deferred slot (e.g. it only carries
+    // mouse movement), there is nothing to replay later
+    if (deferred_change) {
+        if (ib_items == IB_BUFSIZE) {
+            // rather than dropping inputs, apply the oldest report out of order
+            printf("input buffer overflow\n");
+            flush_oldest_buffered_report();
+        }
+        buffered_input_report_t& slot = input_buffer[ib_tail];
+        slot.received_at = get_time();
+        slot.interface = interface;
+        slot.report_id = report_id;
+        slot.len = len;
+        memcpy(slot.data, report, len);
+        ib_tail = (ib_tail + 1) % IB_BUFSIZE;
+        ib_items++;
+    }
+
+    return true;
+}
+
 void do_handle_received_report(const uint8_t* report, int len, uint16_t interface, uint8_t external_report_id) {
     if (len == 0) {
         return;
@@ -1662,16 +1853,14 @@ void do_handle_received_report(const uint8_t* report, int len, uint16_t interfac
     }
 
     if (!is_rollover(report, len, interface, report_id)) {
-        for (int32_t* state_ptr : array_range_usages[interface][report_id]) {
-            *state_ptr &= ~(1 << interface_idx);
-        }
-
-        for (auto const& their : their_used_usages[interface][report_id]) {
-            if (their.usage_def.usage_maximum == 0) {
-                read_input(report, len, their.usage, their.usage_def, interface_idx);
-            } else {
-                read_input_range(report, len, their.usage, their.usage_def, interface_idx, hub_port);
-            }
+        // We check for pending tap-holds before this report is applied so that
+        // the report carrying a tap-hold key's release is itself buffered and
+        // replay only starts once its tap pulse has gone out. A non-empty
+        // buffer keeps buffering so that arrival order is preserved until the
+        // queue fully drains.
+        bool buffering = (ib_items > 0) || tap_hold_pending();
+        if (!buffering || !buffer_input_report(report, len, interface, report_id, interface_idx, hub_port)) {
+            apply_input_report(report, len, interface, report_id, interface_idx, hub_port);
         }
     }
 
@@ -1896,6 +2085,14 @@ void update_their_descriptor_derivates() {
 
     for (int32_t* ptr : relative_usage_set) {
         relative_usages.push_back(ptr);
+    }
+
+    memset(state_slot_immediate, 0, sizeof(state_slot_immediate));
+    for (int32_t* ptr : relative_usage_set) {
+        state_slot_immediate[ptr - input_state] = 1;
+    }
+    for (auto const& tap_hold : tap_hold_usages) {
+        state_slot_immediate[tap_hold.input_state - input_state] = 1;
     }
 
     their_usages_rle.clear();
